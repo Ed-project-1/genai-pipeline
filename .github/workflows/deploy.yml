@@ -1,0 +1,336 @@
+name: Meridian — CI/CD Pipeline
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Triggers
+# ─────────────────────────────────────────────────────────────────────────────
+on:
+  push:
+    branches:
+      - develop        # → deploys to dev
+      - staging        # → deploys to staging
+      - main           # → deploys to prod (requires approval)
+  pull_request:
+    branches:
+      - develop
+      - main
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Environment variables
+# ─────────────────────────────────────────────────────────────────────────────
+env:
+  AWS_REGION:        us-east-1
+  PROJECT_NAME:      meridian
+  ECR_REPO_API:      meridian-api
+  ECR_REPO_INGEST:   meridian-ingestion
+  PYTHON_VERSION:    "3.12"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Jobs
+# ─────────────────────────────────────────────────────────────────────────────
+jobs:
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # JOB 1 — Lint & Unit Tests (runs on every push/PR)
+  # ══════════════════════════════════════════════════════════════════════════
+  test:
+    name: 🧪 Lint & Unit Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install ruff mypy pytest pytest-asyncio pytest-cov httpx
+
+      - name: Lint with ruff
+        run: ruff check src/ tests/
+
+      - name: Type check with mypy
+        run: mypy src/ --ignore-missing-imports
+
+      - name: Run unit tests
+        run: |
+          pytest tests/ \
+            --cov=src \
+            --cov-report=xml \
+            --cov-report=term-missing \
+            -v
+        env:
+          OPENSEARCH_ENDPOINT: "https://mock.us-east-1.aoss.amazonaws.com"
+          OPENSEARCH_INDEX:     "test-index"
+          BEDROCK_REGION:       "us-east-1"
+          RAW_DOCUMENTS_BUCKET: "test-bucket"
+          SESSION_TABLE:        "test-sessions"
+
+      - name: Upload coverage report
+        uses: codecov/codecov-action@v4
+        with:
+          file: ./coverage.xml
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # JOB 2 — Validate CloudFormation
+  # ══════════════════════════════════════════════════════════════════════════
+  validate-cfn:
+    name: ✅ Validate CloudFormation
+    runs-on: ubuntu-latest
+    needs: test
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Validate CloudFormation template
+        run: |
+          aws cloudformation validate-template \
+            --template-body file://infrastructure/cloudformation/main.yaml
+
+      - name: cfn-lint check
+        run: |
+          pip install cfn-lint
+          cfn-lint infrastructure/cloudformation/main.yaml
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # JOB 3 — Build & Push Docker Images to ECR
+  # ══════════════════════════════════════════════════════════════════════════
+  build-and-push:
+    name: 🐳 Build & Push to ECR
+    runs-on: ubuntu-latest
+    needs: [test, validate-cfn]
+    if: github.event_name == 'push'
+
+    permissions:
+      id-token: write
+      contents: read
+
+    outputs:
+      api_image_uri:      ${{ steps.build-api.outputs.image_uri }}
+      ingest_image_uri:   ${{ steps.build-ingest.outputs.image_uri }}
+      image_tag:          ${{ steps.meta.outputs.image_tag }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set image tag
+        id: meta
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-8)
+          echo "image_tag=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Build & push API image
+        id: build-api
+        env:
+          REGISTRY:  ${{ steps.login-ecr.outputs.registry }}
+          TAG:       ${{ steps.meta.outputs.image_tag }}
+        run: |
+          IMAGE_URI="${REGISTRY}/${{ env.ECR_REPO_API }}:${TAG}"
+          docker build \
+            -f Dockerfile.api \
+            -t "${IMAGE_URI}" \
+            -t "${REGISTRY}/${{ env.ECR_REPO_API }}:latest" \
+            .
+          docker push "${IMAGE_URI}"
+          docker push "${REGISTRY}/${{ env.ECR_REPO_API }}:latest"
+          echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
+
+      - name: Build & push Ingestion image
+        id: build-ingest
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          TAG:      ${{ steps.meta.outputs.image_tag }}
+        run: |
+          IMAGE_URI="${REGISTRY}/${{ env.ECR_REPO_INGEST }}:${TAG}"
+          docker build \
+            -f Dockerfile.ingestion \
+            -t "${IMAGE_URI}" \
+            -t "${REGISTRY}/${{ env.ECR_REPO_INGEST }}:latest" \
+            .
+          docker push "${IMAGE_URI}"
+          docker push "${REGISTRY}/${{ env.ECR_REPO_INGEST }}:latest"
+          echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # JOB 4 — Deploy to DEV
+  # ══════════════════════════════════════════════════════════════════════════
+  deploy-dev:
+    name: 🚀 Deploy → DEV
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.ref == 'refs/heads/develop'
+    environment: dev
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEV_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy CloudFormation stack (DEV)
+        run: |
+          aws cloudformation deploy \
+            --template-file infrastructure/cloudformation/main.yaml \
+            --stack-name "${{ env.PROJECT_NAME }}-dev" \
+            --parameter-overrides \
+              Environment=dev \
+              ProjectName=${{ env.PROJECT_NAME }} \
+              ECRImageUri=${{ needs.build-and-push.outputs.api_image_uri }} \
+              IngestionECRImageUri=${{ needs.build-and-push.outputs.ingest_image_uri }} \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --no-fail-on-empty-changeset
+
+      - name: Run smoke tests against DEV
+        run: |
+          API_URL=$(aws cloudformation describe-stacks \
+            --stack-name "${{ env.PROJECT_NAME }}-dev" \
+            --query "Stacks[0].Outputs[?OutputKey=='APIEndpoint'].OutputValue" \
+            --output text)
+          echo "API URL: $API_URL"
+          curl -f "${API_URL}/health" || exit 1
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # JOB 5 — Deploy to STAGING (develop → staging branch)
+  # ══════════════════════════════════════════════════════════════════════════
+  deploy-staging:
+    name: 🧪 Deploy → STAGING
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.ref == 'refs/heads/staging'
+    environment: staging
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_STAGING_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy CloudFormation stack (STAGING)
+        run: |
+          aws cloudformation deploy \
+            --template-file infrastructure/cloudformation/main.yaml \
+            --stack-name "${{ env.PROJECT_NAME }}-staging" \
+            --parameter-overrides \
+              Environment=staging \
+              ProjectName=${{ env.PROJECT_NAME }} \
+              ECRImageUri=${{ needs.build-and-push.outputs.api_image_uri }} \
+              IngestionECRImageUri=${{ needs.build-and-push.outputs.ingest_image_uri }} \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --no-fail-on-empty-changeset
+
+      - name: Run integration tests against STAGING
+        run: pytest tests/integration/ -v --tb=short
+        env:
+          API_BASE_URL: ${{ secrets.STAGING_API_URL }}
+
+  # ══════════════════════════════════════════════════════════════════════════
+  # JOB 6 — Deploy to PROD (requires manual approval)
+  # ══════════════════════════════════════════════════════════════════════════
+  deploy-prod:
+    name: 🏭 Deploy → PROD
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: production
+      url: ${{ steps.get-url.outputs.api_url }}   # shown in GitHub UI
+
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_PROD_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Create CloudFormation change set
+        id: changeset
+        run: |
+          CHANGESET_NAME="deploy-${{ github.sha }}"
+          aws cloudformation create-change-set \
+            --template-file infrastructure/cloudformation/main.yaml \
+            --stack-name "${{ env.PROJECT_NAME }}-prod" \
+            --change-set-name "${CHANGESET_NAME}" \
+            --parameter-overrides \
+              Environment=prod \
+              ProjectName=${{ env.PROJECT_NAME }} \
+              ECRImageUri=${{ needs.build-and-push.outputs.api_image_uri }} \
+              IngestionECRImageUri=${{ needs.build-and-push.outputs.ingest_image_uri }} \
+            --capabilities CAPABILITY_NAMED_IAM
+          echo "changeset_name=${CHANGESET_NAME}" >> "$GITHUB_OUTPUT"
+          # Wait for change set to be created
+          aws cloudformation wait change-set-create-complete \
+            --stack-name "${{ env.PROJECT_NAME }}-prod" \
+            --change-set-name "${CHANGESET_NAME}"
+
+      - name: Execute CloudFormation change set
+        run: |
+          aws cloudformation execute-change-set \
+            --stack-name "${{ env.PROJECT_NAME }}-prod" \
+            --change-set-name "${{ steps.changeset.outputs.changeset_name }}"
+          aws cloudformation wait stack-update-complete \
+            --stack-name "${{ env.PROJECT_NAME }}-prod"
+
+      - name: Get API URL
+        id: get-url
+        run: |
+          URL=$(aws cloudformation describe-stacks \
+            --stack-name "${{ env.PROJECT_NAME }}-prod" \
+            --query "Stacks[0].Outputs[?OutputKey=='APIEndpoint'].OutputValue" \
+            --output text)
+          echo "api_url=${URL}" >> "$GITHUB_OUTPUT"
+
+      - name: Post-deploy smoke test
+        run: |
+          curl -f "${{ steps.get-url.outputs.api_url }}/health" || exit 1
+          echo "✅ Production deployment successful"
