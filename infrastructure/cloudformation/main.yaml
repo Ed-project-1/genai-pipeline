@@ -1,0 +1,723 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Project Meridian — GenAI RAG Pipeline
+  Full stack: VPC, S3, OpenSearch Serverless, Lambda (Ingestion + API),
+  API Gateway, SQS, DynamoDB, IAM, CloudWatch, Cognito.
+
+# ─────────────────────────────────────────────────────────────────────────────
+Parameters:
+# ─────────────────────────────────────────────────────────────────────────────
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment environment
+
+  ProjectName:
+    Type: String
+    Default: meridian
+    Description: Project name prefix for all resources
+
+  ECRImageUri:
+    Type: String
+    Description: >
+      ECR URI for the Lambda container image.
+      e.g. 123456789012.dkr.ecr.us-east-1.amazonaws.com/meridian-api:latest
+
+  IngestionECRImageUri:
+    Type: String
+    Description: ECR URI for the ingestion Lambda container image.
+
+  OpenSearchCollectionName:
+    Type: String
+    Default: meridian-vectors
+    Description: Name of the OpenSearch Serverless collection
+
+  BedrockRegion:
+    Type: String
+    Default: us-east-1
+    Description: AWS region for Bedrock API calls
+
+  PrimaryModelId:
+    Type: String
+    Default: anthropic.claude-3-5-sonnet-20241022-v2:0
+
+  FallbackModelId:
+    Type: String
+    Default: meta.llama3-1-70b-instruct-v1:0
+
+  VpcCidr:
+    Type: String
+    Default: "10.0.0.0/16"
+
+  PrivateSubnet1Cidr:
+    Type: String
+    Default: "10.0.1.0/24"
+
+  PrivateSubnet2Cidr:
+    Type: String
+    Default: "10.0.2.0/24"
+
+  PublicSubnet1Cidr:
+    Type: String
+    Default: "10.0.10.0/24"
+
+  DailyTokenBudget:
+    Type: Number
+    Default: 100000
+    Description: Per-user daily token budget
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Conditions
+# ─────────────────────────────────────────────────────────────────────────────
+
+Conditions:
+  IsProd: !Equals [!Ref Environment, prod]
+
+# ─────────────────────────────────────────────────────────────────────────────
+Resources:
+# ─────────────────────────────────────────────────────────────────────────────
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # VPC & Networking
+  # ════════════════════════════════════════════════════════════════════════════
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-vpc"
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-igw"
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnet1Cidr
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-public-1"
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnet1Cidr
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-private-1"
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-private-2"
+
+  # NAT Gateway for private subnet internet access (Lambda → Bedrock fallback)
+  EIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt EIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-nat"
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: "0.0.0.0/0"
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: "0.0.0.0/0"
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnet1RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  # VPC Endpoints — keep all traffic off the public internet
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+      VpcId: !Ref VPC
+      RouteTableIds:
+        - !Ref PrivateRouteTable
+      VpcEndpointType: Gateway
+
+  BedrockRuntimeEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.bedrock-runtime"
+      VpcId: !Ref VPC
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref LambdaSecurityGroup
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # Security Groups
+  # ════════════════════════════════════════════════════════════════════════════
+
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Lambda functions
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: "0.0.0.0/0"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-${Environment}-lambda-sg"
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # S3 Buckets
+  # ════════════════════════════════════════════════════════════════════════════
+
+  RawDocumentsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-${Environment}-raw-docs-${AWS::AccountId}"
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 90
+                StorageClass: STANDARD_IA
+      NotificationConfiguration:
+        QueueConfigurations:
+          - Event: "s3:ObjectCreated:*"
+            Queue: !GetAtt IngestionQueue.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: "uploads/"
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # SQS — Ingestion queue (decouples S3 events from Lambda)
+  # ════════════════════════════════════════════════════════════════════════════
+
+  IngestionDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ProjectName}-${Environment}-ingestion-dlq"
+      MessageRetentionPeriod: 1209600   # 14 days
+
+  IngestionQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${ProjectName}-${Environment}-ingestion-queue"
+      VisibilityTimeout: 960            # 16 min (Lambda max = 15 min + buffer)
+      MessageRetentionPeriod: 86400     # 1 day
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt IngestionDLQ.Arn
+        maxReceiveCount: 3
+
+  IngestionQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref IngestionQueue
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: "sqs:SendMessage"
+            Resource: !GetAtt IngestionQueue.Arn
+            Condition:
+              ArnLike:
+                "aws:SourceArn": !Sub "arn:aws:s3:::${ProjectName}-${Environment}-raw-docs-${AWS::AccountId}"
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # DynamoDB — Session state store
+  # ════════════════════════════════════════════════════════════════════════════
+
+  SessionTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${ProjectName}-${Environment}-sessions"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: conversation_id
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: conversation_id
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # OpenSearch Serverless
+  # ════════════════════════════════════════════════════════════════════════════
+
+  # Encryption policy
+  OpenSearchEncryptionPolicy:
+    Type: AWS::OpenSearchServerless::SecurityPolicy
+    Properties:
+      Name: !Sub "${ProjectName}-${Environment}-enc"
+      Type: encryption
+      Policy: !Sub |
+        {"Rules":[{"ResourceType":"collection","Resource":["collection/${OpenSearchCollectionName}"]}],"AWSOwnedKey":true}
+
+  # Network policy — allow VPC access only
+  OpenSearchNetworkPolicy:
+    Type: AWS::OpenSearchServerless::SecurityPolicy
+    Properties:
+      Name: !Sub "${ProjectName}-${Environment}-net"
+      Type: network
+      Policy: !Sub |
+        [{"Rules":[{"ResourceType":"collection","Resource":["collection/${OpenSearchCollectionName}"]},
+        {"ResourceType":"dashboard","Resource":["collection/${OpenSearchCollectionName}"]}],
+        "AllowFromPublic":false,
+        "SourceVPCEs":["${OpenSearchVPCEndpoint}"]}]
+
+  OpenSearchVPCEndpoint:
+    Type: AWS::OpenSearchServerless::VpcEndpoint
+    Properties:
+      Name: !Sub "${ProjectName}-${Environment}-aoss-vpce"
+      VpcId: !Ref VPC
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref LambdaSecurityGroup
+
+  # Data access policy — grant Lambda roles read/write
+  OpenSearchDataAccessPolicy:
+    Type: AWS::OpenSearchServerless::AccessPolicy
+    Properties:
+      Name: !Sub "${ProjectName}-${Environment}-data"
+      Type: data
+      Policy: !Sub |
+        [{"Rules":[
+          {"ResourceType":"index","Resource":["index/${OpenSearchCollectionName}/*"],
+           "Permission":["aoss:CreateIndex","aoss:DeleteIndex","aoss:UpdateIndex",
+                         "aoss:DescribeIndex","aoss:ReadDocument","aoss:WriteDocument"]},
+          {"ResourceType":"collection","Resource":["collection/${OpenSearchCollectionName}"],
+           "Permission":["aoss:CreateCollectionItems","aoss:DeleteCollectionItems","aoss:UpdateCollectionItems","aoss:DescribeCollectionItems"]}
+        ],"Principal":["${LambdaExecutionRole.Arn}","${IngestionLambdaRole.Arn}"]}]
+
+  OpenSearchCollection:
+    Type: AWS::OpenSearchServerless::Collection
+    DependsOn:
+      - OpenSearchEncryptionPolicy
+      - OpenSearchNetworkPolicy
+      - OpenSearchDataAccessPolicy
+    Properties:
+      Name: !Ref OpenSearchCollectionName
+      Type: VECTORSEARCH
+      Description: !Sub "Vector store for ${ProjectName} ${Environment}"
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # IAM Roles
+  # ════════════════════════════════════════════════════════════════════════════
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${Environment}-api-lambda-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: MeridianAPIPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: BedrockInvoke
+                Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource:
+                  - !Sub "arn:aws:bedrock:${BedrockRegion}::foundation-model/${PrimaryModelId}"
+                  - !Sub "arn:aws:bedrock:${BedrockRegion}::foundation-model/amazon.titan-embed-text-v2:0"
+              - Sid: OpenSearchAccess
+                Effect: Allow
+                Action:
+                  - aoss:APIAccessAll
+                Resource: !Sub "arn:aws:aoss:${AWS::Region}:${AWS::AccountId}:collection/*"
+              - Sid: S3Access
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:HeadObject
+                  - s3:GeneratePresignedUrl
+                Resource:
+                  - !Sub "${RawDocumentsBucket.Arn}/*"
+              - Sid: DynamoDBAccess
+                Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                Resource: !GetAtt SessionTable.Arn
+              - Sid: CloudWatchLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  IngestionLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${Environment}-ingestion-lambda-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: IngestionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: S3Read
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:HeadObject
+                Resource: !Sub "${RawDocumentsBucket.Arn}/*"
+              - Sid: SQSRead
+                Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt IngestionQueue.Arn
+              - Sid: BedrockEmbeddings
+                Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource:
+                  - !Sub "arn:aws:bedrock:${BedrockRegion}::foundation-model/amazon.titan-embed-text-v2:0"
+              - Sid: OpenSearchWrite
+                Effect: Allow
+                Action:
+                  - aoss:APIAccessAll
+                Resource: "*"
+              - Sid: CloudWatchLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # Lambda Functions
+  # ════════════════════════════════════════════════════════════════════════════
+
+  IngestionFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-${Environment}-ingestion"
+      PackageType: Image
+      Code:
+        ImageUri: !Ref IngestionECRImageUri
+      Role: !GetAtt IngestionLambdaRole.Arn
+      Timeout: 900          # 15 minutes
+      MemorySize: 1024
+      VpcConfig:
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+      Environment:
+        Variables:
+          OPENSEARCH_ENDPOINT: !Sub "https://${OpenSearchCollection}.${AWS::Region}.aoss.amazonaws.com"
+          OPENSEARCH_INDEX:    !Sub "${ProjectName}-docs"
+          BEDROCK_REGION:      !Ref BedrockRegion
+          CHUNK_SIZE:          "1000"
+          CHUNK_OVERLAP:       "200"
+      ReservedConcurrentExecutions: 10
+
+  IngestionEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt IngestionQueue.Arn
+      FunctionName: !GetAtt IngestionFunction.Arn
+      BatchSize: 1
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
+
+  APIFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-${Environment}-api"
+      PackageType: Image
+      Code:
+        ImageUri: !Ref ECRImageUri
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      MemorySize: 512
+      VpcConfig:
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+      Environment:
+        Variables:
+          OPENSEARCH_ENDPOINT:    !Sub "https://${OpenSearchCollection}.${AWS::Region}.aoss.amazonaws.com"
+          OPENSEARCH_INDEX:       !Sub "${ProjectName}-docs"
+          BEDROCK_REGION:         !Ref BedrockRegion
+          PRIMARY_MODEL_ID:       !Ref PrimaryModelId
+          FALLBACK_MODEL_ID:      !Ref FallbackModelId
+          RAW_DOCUMENTS_BUCKET:   !Ref RawDocumentsBucket
+          SESSION_TABLE:          !Ref SessionTable
+          DAILY_TOKEN_BUDGET:     !Ref DailyTokenBudget
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # API Gateway
+  # ════════════════════════════════════════════════════════════════════════════
+
+  APIGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "${ProjectName}-${Environment}-api"
+      Description: Project Meridian RAG API
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  APIGatewayResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref APIGateway
+      ParentId: !GetAtt APIGateway.RootResourceId
+      PathPart: "{proxy+}"
+
+  APIGatewayMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref APIGateway
+      ResourceId: !Ref APIGatewayResource
+      HttpMethod: ANY
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${APIFunction.Arn}/invocations"
+
+  APIGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: APIGatewayMethod
+    Properties:
+      RestApiId: !Ref APIGateway
+
+  APIGatewayStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref APIGateway
+      DeploymentId: !Ref APIGatewayDeployment
+      StageName: !Ref Environment
+
+  LambdaAPIGatewayPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref APIFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${APIGateway}/*"
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # Cognito User Pool
+  # ════════════════════════════════════════════════════════════════════════════
+
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${ProjectName}-${Environment}-users"
+      AutoVerifiedAttributes:
+        - email
+      Schema:
+        - Name: classification
+          AttributeDataType: String
+          Mutable: true
+
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub "${ProjectName}-${Environment}-client"
+      UserPoolId: !Ref CognitoUserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+
+  CognitoAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      Name: !Sub "${ProjectName}-${Environment}-cognito-auth"
+      Type: COGNITO_USER_POOLS
+      IdentitySource: method.request.header.Authorization
+      RestApiId: !Ref APIGateway
+      ProviderARNs:
+        - !GetAtt CognitoUserPool.Arn
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # CloudWatch Alarms
+  # ════════════════════════════════════════════════════════════════════════════
+
+  IngestionErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${Environment}-ingestion-errors"
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref IngestionFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+
+  DLQDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${Environment}-dlq-depth"
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt IngestionDLQ.QueueName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+
+# ─────────────────────────────────────────────────────────────────────────────
+Outputs:
+# ─────────────────────────────────────────────────────────────────────────────
+
+  APIEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub "https://${APIGateway}.execute-api.${AWS::Region}.amazonaws.com/${Environment}"
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-api-endpoint"
+
+  OpenSearchEndpoint:
+    Description: OpenSearch Serverless collection endpoint
+    Value: !Sub "https://${OpenSearchCollection}.${AWS::Region}.aoss.amazonaws.com"
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-opensearch-endpoint"
+
+  RawDocumentsBucketName:
+    Description: S3 bucket for raw document uploads
+    Value: !Ref RawDocumentsBucket
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-raw-bucket"
+
+  CognitoUserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref CognitoUserPool
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-userpool-id"
+
+  CognitoClientId:
+    Description: Cognito App Client ID
+    Value: !Ref CognitoUserPoolClient
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-client-id"
