@@ -1,0 +1,406 @@
+================================================================================
+MEETING MEMORANDUM
+================================================================================
+SUBJECT:   Q3 Strategic Planning & AI Infrastructure Roadmap
+DATE:      September 12, 2024
+LOCATION:  Headquarters – Executive Boardroom 4A (Hybrid)
+DURATION:  9:00 AM – 1:30 PM EST
+
+ATTENDEES:
+  - Sarah Mitchell       | Chief Technology Officer (Chair)
+  - Dr. James Okonkwo    | VP of AI & Data Science
+  - Rachel Tran          | Director of Cloud Infrastructure
+  - Marcus Webb          | Lead ML Engineer
+  - Priya Sharma         | Product Manager – AI Initiatives
+  - Daniel Kovacs        | Head of Security & Compliance
+  - Angela Torres        | Director of Engineering
+  - Tom Nakamura         | Finance Controller
+  - Leila Ahmadi         | Senior Data Engineer
+  - Chris Fontaine       | DevOps Lead
+  - Nina Patel           | UX Research Lead
+  - Greg Sullivan        | VP of Sales & Strategic Partnerships
+
+ABSENT / APOLOGIES:
+  - CEO (travel – received briefing document)
+  - Legal Counsel (provided written input)
+
+FACILITATOR:   Sarah Mitchell
+NOTE-TAKER:    Leila Ahmadi
+
+================================================================================
+EXECUTIVE SUMMARY
+================================================================================
+
+This meeting was convened to finalize the Q3 AI infrastructure roadmap,
+approve budget allocations for the generative AI platform, review security
+and compliance postures, and align cross-functional teams on delivery
+milestones. Key decisions include the adoption of AWS Bedrock as the primary
+LLM provider, approval of a $2.4M infrastructure budget, and the green-light
+for Phase 1 of the internal AI assistant ("Project Meridian").
+
+================================================================================
+AGENDA ITEM 1: OPENING REMARKS & STRATEGIC CONTEXT
+================================================================================
+
+Sarah Mitchell opened the meeting at 9:04 AM. She noted the company is at a
+critical inflection point: three major enterprise competitors have already
+deployed internal GenAI tools, and customer surveys (Q2 2024) indicate 67%
+of enterprise clients now expect AI-augmented services as a baseline offering.
+
+She emphasized that this roadmap must balance:
+  (a) Speed-to-market for competitive parity
+  (b) Security and data governance — particularly given upcoming EU AI Act
+      compliance requirements effective March 2025
+  (c) Cost discipline — the board has set a hard ceiling of $3M for H2 2024
+      AI infrastructure spend
+
+Sarah introduced the three strategic pillars for the AI buildout:
+  1. INTERNAL PRODUCTIVITY — GenAI tools for employees (summarization,
+     search, code assistance, meeting intelligence)
+  2. CUSTOMER-FACING PRODUCTS — AI-powered features embedded in the
+     core product suite (smart recommendations, document Q&A, auto-reports)
+  3. DATA PLATFORM MODERNIZATION — RAG pipelines, vector databases, and
+     a unified data layer to support AI workloads at scale
+
+================================================================================
+AGENDA ITEM 2: TECHNICAL ARCHITECTURE REVIEW
+================================================================================
+
+Dr. James Okonkwo presented the proposed architecture diagram (shared screen,
+slides available in Confluence: /AI-Roadmap/Q3-2024/Architecture).
+
+KEY ARCHITECTURAL DECISIONS:
+
+  2.1 LLM Provider Selection
+  ---------------------------
+  After a 6-week evaluation of OpenAI (Azure), Google Vertex AI, AWS Bedrock,
+  and Cohere, the team recommends AWS Bedrock as the primary LLM provider.
+
+  Evaluation criteria and scores (1–10):
+    Criteria                | Azure/OpenAI | Vertex AI | AWS Bedrock | Cohere
+    ------------------------|--------------|-----------|-------------|-------
+    Data residency controls |     6        |    7      |     9       |   7
+    Enterprise SLA          |     8        |    7      |     9       |   6
+    Model variety           |     9        |    8      |     8       |   5
+    Cost at scale           |     5        |    6      |     8       |   8
+    IAM / VPC integration   |     4        |    5      |     10      |   4
+    Compliance certs        |     7        |    7      |     9       |   6
+    Langchain compatibility |     9        |    8      |     8       |   7
+
+  AWS Bedrock advantages:
+  - Native IAM integration — no external API keys stored in secrets
+  - VPC endpoints — all traffic stays within the AWS network
+  - SOC 2 Type II, ISO 27001, HIPAA eligible — matches our compliance needs
+  - Supports Claude 3, Llama 3.1, Mistral, Titan, and Cohere natively
+  - Bedrock Knowledge Bases integrates natively with OpenSearch Serverless
+
+  Primary model selected: Anthropic Claude 3.5 Sonnet (bedrock alias)
+  Fallback model: Meta Llama 3.1 70B Instruct (cost-optimized tasks)
+
+  2.2 Vector Database Selection
+  ------------------------------
+  Decision: Amazon OpenSearch Serverless (vector engine mode)
+
+  Alternatives considered:
+    - Pinecone: Excellent performance but external SaaS — data residency concern
+    - Weaviate (self-hosted on EKS): High operational overhead
+    - pgvector on Aurora: Good for small scale; may bottleneck at >10M vectors
+    - OpenSearch Serverless: Native AWS, no infra to manage, auto-scales,
+      supports ANN (approximate nearest neighbor) with NMSLIB and FAISS engines
+
+  Marcus Webb noted that LangChain has a first-class OpenSearch integration
+  via `langchain_community.vectorstores.OpenSearchVectorSearch`, which
+  simplifies the retrieval chain implementation significantly.
+
+  Vector dimensions: 1536 (Titan Embeddings v2) or 768 (Cohere Embed)
+  Selected embedding model: Amazon Titan Embeddings V2 (bedrock)
+  Chunking strategy: Recursive character text splitter, chunk_size=1000,
+  chunk_overlap=200
+
+  2.3 Application Layer
+  ----------------------
+  Framework: LangChain (Python) — v0.2.x
+  API Layer: FastAPI on AWS Lambda (containerized via Lambda Container Images)
+  Orchestration: LangChain LCEL (LangChain Expression Language) pipelines
+  Agents: LangChain AgentExecutor with custom tools:
+    - DocumentSearchTool (vector retrieval)
+    - SummaryTool (map-reduce summarization)
+    - MetadataFilterTool (OpenSearch metadata filters)
+    - CalendarTool (stub — Phase 2)
+
+  2.4 Infrastructure as Code
+  ---------------------------
+  Tool: AWS CloudFormation (YAML templates)
+  Deployment pipeline: GitHub Actions CI/CD
+  Environments: dev → staging → prod (separate AWS accounts via Organizations)
+  Secrets management: AWS Secrets Manager + Parameter Store
+  Logging: CloudWatch Logs + X-Ray distributed tracing
+  Storage: S3 (raw documents), S3 (processed/chunked), DynamoDB (session state)
+
+  Angela Torres raised the question of whether to use CDK instead of raw
+  CloudFormation. After discussion, the team agreed raw CloudFormation YAML
+  is preferred because:
+    - The infrastructure team has more CF expertise
+    - CDK adds a build step that complicates the GitHub Actions pipeline
+    - CF templates are more auditable for compliance reviews
+    - CDK can always be adopted in Phase 3 if needed
+
+================================================================================
+AGENDA ITEM 3: PROJECT MERIDIAN — PHASE 1 SCOPE
+================================================================================
+
+Priya Sharma walked through the Phase 1 product scope.
+
+Project Meridian is an internal AI assistant that allows employees to:
+  1. Upload meeting memos, PDFs, Word documents, and Confluence exports
+  2. Ask natural-language questions against the document corpus
+  3. Generate summaries, action item extracts, and status reports
+  4. Receive source-cited answers with document provenance
+
+Phase 1 deliverables (target: November 30, 2024):
+  - Document ingestion pipeline (S3 → Lambda → chunking → embeddings → OpenSearch)
+  - RAG Q&A endpoint (FastAPI + LangChain + Bedrock)
+  - Simple chat UI (React, internal only)
+  - Admin panel for document management
+  - GitHub Actions CI/CD pipeline
+  - Full CloudFormation stack (VPC, Lambda, OpenSearch, S3, IAM)
+
+Out of scope for Phase 1:
+  - Multi-tenant isolation (Phase 2)
+  - Real-time document streaming
+  - Fine-tuning or model customization
+  - Integration with Slack / Teams
+  - Customer-facing deployment
+
+Nina Patel shared UX research findings: internal testers (n=24) rated the
+prototype Q&A interface 4.2/5 for usefulness but noted confusion around
+source citations. She recommended surfacing document name, date, and page
+number alongside each answer. The team agreed to include this in Phase 1.
+
+================================================================================
+AGENDA ITEM 4: SECURITY & COMPLIANCE REVIEW
+================================================================================
+
+Daniel Kovacs presented the security architecture.
+
+  4.1 Data Classification
+  ------------------------
+  Documents ingested into Meridian are classified as:
+    - INTERNAL (default) — accessible to all employees
+    - CONFIDENTIAL — restricted to designated teams (HR, Legal, Finance)
+    - SECRET — executive-only; scoped access via IAM conditions
+
+  Metadata tagging at ingest time will encode classification level.
+  LangChain retrieval filters will enforce classification gates at query time.
+
+  4.2 Network Security
+  ---------------------
+  - All Lambda functions deployed inside a private VPC
+  - OpenSearch domain accessible only via VPC endpoint
+  - Bedrock API calls routed via VPC interface endpoint (no internet egress)
+  - S3 access via VPC gateway endpoint
+  - No public internet exposure for any backend service
+  - API Gateway (public-facing) sits in front of Lambda, with Cognito auth
+
+  4.3 Identity & Access
+  ----------------------
+  - Users authenticate via Cognito User Pools (SSO via existing Okta IdP)
+  - Lambda execution roles follow least-privilege principle
+  - Bedrock model access gated via resource-based IAM policies
+  - All access logs shipped to CloudWatch; SIEM integration in Phase 2
+
+  4.4 EU AI Act Compliance Notes (from Legal, written input)
+  -----------------------------------------------------------
+  The EU AI Act classifies internal productivity AI tools as "limited risk."
+  Requirements applicable to Phase 1:
+    - Transparency notice to employees that AI is processing their queries
+    - Human oversight mechanism (feedback buttons, escalation path)
+    - Data retention policy: query logs purged after 90 days
+    - No automated decision-making with legal or HR implications in Phase 1
+
+  Daniel confirmed the architecture meets these requirements. A formal
+  compliance attestation document will be prepared by Legal before launch.
+
+================================================================================
+AGENDA ITEM 5: BUDGET & RESOURCE PLAN
+================================================================================
+
+Tom Nakamura presented the budget breakdown.
+
+  H2 2024 AI Infrastructure Budget — Approved: $2,400,000
+
+  Breakdown:
+    Category                          | Estimate    | % of Total
+    ----------------------------------|-------------|------------
+    AWS Infrastructure (compute/net)  | $480,000    | 20%
+    AWS Bedrock (LLM inference)       | $360,000    | 15%
+    AWS OpenSearch Serverless         | $240,000    | 10%
+    AWS S3 + DynamoDB + misc          | $120,000    | 5%
+    Engineering (contract + FTE time) | $840,000    | 35%
+    Security tooling & audits         | $180,000    | 7.5%
+    Training & documentation          | $60,000     | 2.5%
+    Contingency (10%)                 | $120,000    | 5%
+
+  Tom flagged that Bedrock costs are highly variable based on token usage.
+  Current estimate assumes 50M input tokens/month and 10M output tokens/month
+  at Claude 3.5 Sonnet pricing. A cost dashboard in CloudWatch will trigger
+  alerts at 70% and 90% of monthly budget.
+
+  Marcus Webb suggested implementing a token budget per user per day as a
+  guardrail. The team agreed to set a default of 100K tokens/user/day with
+  admin override capability.
+
+================================================================================
+AGENDA ITEM 6: DELIVERY MILESTONES & TEAM ASSIGNMENTS
+================================================================================
+
+Angela Torres presented the delivery plan.
+
+  MILESTONE SCHEDULE:
+
+  M1 — Infrastructure Foundation           Target: September 27, 2024
+    - CloudFormation VPC + networking stack
+    - S3 buckets, IAM roles, Secrets Manager
+    - OpenSearch Serverless collection
+    Owner: Rachel Tran, Chris Fontaine
+
+  M2 — Ingestion Pipeline                  Target: October 11, 2024
+    - S3 event trigger → Lambda ingestion function
+    - Document parsing (PDF, DOCX, TXT)
+    - LangChain chunking + Titan embeddings
+    - OpenSearch vector indexing
+    Owner: Leila Ahmadi, Marcus Webb
+
+  M3 — RAG Query API                       Target: October 25, 2024
+    - FastAPI Lambda container
+    - LangChain RetrievalQA chain with LCEL
+    - Bedrock Claude 3.5 Sonnet integration
+    - Source citation formatting
+    Owner: Marcus Webb, Dr. James Okonkwo
+
+  M4 — CI/CD Pipeline                      Target: October 18, 2024
+    - GitHub Actions workflows (lint, test, deploy)
+    - Multi-environment promotion (dev → staging → prod)
+    - Automated CloudFormation change set deployment
+    Owner: Chris Fontaine, Angela Torres
+
+  M5 — Frontend & Auth                     Target: November 8, 2024
+    - React chat interface
+    - Cognito + Okta SSO integration
+    - Document upload UI
+    - Source citation display
+    Owner: Nina Patel, Angela Torres
+
+  M6 — Testing, Security Review & Launch   Target: November 30, 2024
+    - End-to-end integration testing
+    - Penetration test (external vendor)
+    - Performance load test (target: 200 concurrent users)
+    - EU AI Act compliance documentation
+    - Soft launch to 50 pilot users
+    Owner: All teams
+
+================================================================================
+AGENDA ITEM 7: RISKS & MITIGATIONS
+================================================================================
+
+  Risk                        | Likelihood | Impact | Mitigation
+  ----------------------------|------------|--------|---------------------------
+  Bedrock rate limits at scale| Medium     | High   | Request quota increases;
+                              |            |        | implement retry/backoff
+  OpenSearch cost overrun     | Medium     | Medium | Monitor OCU usage; enable
+                              |            |        | auto-suspend on idle
+  LangChain breaking changes  | Low        | High   | Pin to v0.2.x; test suite
+                              |            |        | with every dependency bump
+  Data classification errors  | Low        | High   | Mandatory metadata at
+                              |            |        | ingest; audit monthly
+  EU AI Act non-compliance    | Low        | High   | Legal review at M6;
+                              |            |        | compliance officer signoff
+  Key engineer departure      | Low        | High   | Pair programming; runbooks
+                              |            |        | for all critical paths
+
+================================================================================
+AGENDA ITEM 8: OPEN DISCUSSION & AOB
+================================================================================
+
+  8.1 Greg Sullivan (Sales) asked whether Phase 1 outputs could be
+      demoed to enterprise prospects as a proof point. The team agreed
+      to prepare a sanitized demo environment by November 15, 2024.
+      Action: Priya Sharma to coordinate with Sales on demo data set.
+
+  8.2 Rachel Tran raised multi-region DR considerations. Agreed to
+      defer to Phase 2 but document RTO/RPO targets now.
+      Target RTO: 4 hours | Target RPO: 1 hour
+
+  8.3 Chris Fontaine asked about the branching strategy for GitHub.
+      Agreed: GitFlow with protected main and develop branches.
+      Feature branches: feature/JIRA-XXX
+      Release branches: release/vX.Y.Z
+      Hotfix branches: hotfix/description
+
+  8.4 Leila Ahmadi flagged that large PDF documents (>100 pages) may
+      exceed Lambda's 15-minute timeout during ingestion. Proposed
+      solution: S3 event → SQS queue → Lambda with extended timeout cap,
+      or migrate heavy ingestion to AWS Batch. Agreed: use SQS buffering
+      and Lambda with 15-min timeout for Phase 1; evaluate Batch for Phase 2.
+
+================================================================================
+ACTION ITEMS
+================================================================================
+
+  #   | Owner             | Action                                  | Due Date
+  ----|-------------------|-----------------------------------------|----------
+  A1  | Rachel Tran       | Deploy VPC CloudFormation stack (M1)    | Sep 20
+  A2  | Chris Fontaine    | Set up GitHub org, repos, branch rules  | Sep 16
+  A3  | Marcus Webb       | Prototype LangChain RAG chain locally   | Sep 20
+  A4  | Leila Ahmadi      | Write ingestion Lambda (draft)          | Sep 23
+  A5  | Daniel Kovacs     | Submit Bedrock quota increase request   | Sep 13
+  A6  | Tom Nakamura      | Set up AWS Cost Anomaly Detection       | Sep 16
+  A7  | Priya Sharma      | Draft EU AI Act transparency notice     | Sep 20
+  A8  | Dr. James Okonkwo | Finalize embedding model benchmark      | Sep 18
+  A9  | Angela Torres     | Create JIRA epic structure for Meridian | Sep 13
+  A10 | Nina Patel        | Prepare UX wireframes v2 with citations | Sep 23
+  A11 | Priya Sharma      | Coordinate demo environment with Sales  | Nov 15
+  A12 | Rachel Tran       | Document RTO/RPO targets for DR plan    | Sep 27
+
+================================================================================
+DECISIONS LOG
+================================================================================
+
+  D1: AWS Bedrock selected as primary LLM provider (unanimous)
+  D2: Claude 3.5 Sonnet as primary model; Llama 3.1 70B as fallback
+  D3: Amazon OpenSearch Serverless as vector database
+  D4: Amazon Titan Embeddings V2 for document embeddings
+  D5: LangChain v0.2.x as orchestration framework
+  D6: CloudFormation (not CDK) for infrastructure as code
+  D7: GitHub Actions for CI/CD
+  D8: $2.4M H2 2024 AI infrastructure budget approved
+  D9: 100K daily token limit per user (admin-overridable)
+  D10: GitFlow branching strategy for the monorepo
+  D11: SQS buffering for ingestion Lambda (large document handling)
+  D12: Soft launch to 50 pilot users by November 30, 2024
+
+================================================================================
+NEXT MEETING
+================================================================================
+
+Project Meridian — Sprint Review & M1 Check-in
+Date:      September 27, 2024, 10:00 AM EST
+Location:  Hybrid (same room + Zoom)
+Agenda:    M1 CloudFormation stack demo, ingestion pipeline progress,
+           CI/CD pipeline walkthrough, Q&A
+
+================================================================================
+DISTRIBUTION LIST
+================================================================================
+
+  This memorandum is classified INTERNAL.
+  Distributed to all attendees + CEO's office + Legal Counsel.
+  Archived to Confluence: /AI-Roadmap/Q3-2024/Meeting-Memos/2024-09-12
+
+  Prepared by: Leila Ahmadi
+  Reviewed by: Sarah Mitchell
+  Approved for distribution: Sarah Mitchell
+
+================================================================================
+END OF MEMORANDUM
+================================================================================

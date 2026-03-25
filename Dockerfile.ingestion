@@ -1,0 +1,15 @@
+# Dockerfile.ingestion — Ingestion Lambda Container Image
+FROM public.ecr.aws/lambda/python:3.12
+
+RUN dnf install -y gcc python3-devel && dnf clean all
+
+WORKDIR ${LAMBDA_TASK_ROOT}
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY src/ ./src/
+
+RUN chmod -R 755 ${LAMBDA_TASK_ROOT}
+
+CMD ["src.ingestion.handler.handler"]

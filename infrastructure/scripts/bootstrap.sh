@@ -53,8 +53,8 @@ fi
 echo ""
 echo "▶ Step 3: Creating GitHub Actions deploy role..."
 
-GITHUB_ORG="YOUR_GITHUB_ORG"    # ← CHANGE THIS
-GITHUB_REPO="YOUR_REPO_NAME"    # ← CHANGE THIS
+GITHUB_ORG="Ed-project-1"    # ← CHANGE THIS
+GITHUB_REPO="genai-pipeline"    # ← CHANGE THIS
 
 TRUST_POLICY=$(cat <<EOF
 {

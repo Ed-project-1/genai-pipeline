@@ -41,7 +41,7 @@ Parameters:
 
   PrimaryModelId:
     Type: String
-    Default: anthropic.claude-3-5-sonnet-20241022-v2:0
+    Default: us.anthropic.claude-sonnet-4-20250514-v1:0
 
   FallbackModelId:
     Type: String
@@ -137,7 +137,6 @@ Resources:
         - Key: Name
           Value: !Sub "${ProjectName}-${Environment}-private-2"
 
-  # NAT Gateway for private subnet internet access (Lambda → Bedrock fallback)
   EIP:
     Type: AWS::EC2::EIP
     Properties:
@@ -195,7 +194,7 @@ Resources:
       SubnetId: !Ref PrivateSubnet2
       RouteTableId: !Ref PrivateRouteTable
 
-  # VPC Endpoints — keep all traffic off the public internet
+  # S3 Gateway Endpoint
   S3GatewayEndpoint:
     Type: AWS::EC2::VPCEndpoint
     Properties:
@@ -205,23 +204,7 @@ Resources:
         - !Ref PrivateRouteTable
       VpcEndpointType: Gateway
 
-  BedrockRuntimeEndpoint:
-    Type: AWS::EC2::VPCEndpoint
-    Properties:
-      ServiceName: !Sub "com.amazonaws.${AWS::Region}.bedrock-runtime"
-      VpcId: !Ref VPC
-      SubnetIds:
-        - !Ref PrivateSubnet1
-        - !Ref PrivateSubnet2
-      SecurityGroupIds:
-        - !Ref LambdaSecurityGroup
-      VpcEndpointType: Interface
-      PrivateDnsEnabled: true
-
-  # ════════════════════════════════════════════════════════════════════════════
-  # Security Groups
-  # ════════════════════════════════════════════════════════════════════════════
-
+  # Security Group for Lambda
   LambdaSecurityGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
@@ -238,8 +221,10 @@ Resources:
   # S3 Buckets
   # ════════════════════════════════════════════════════════════════════════════
 
+  # FIX 3: DependsOn IngestionQueuePolicy so S3 notification permission exists first
   RawDocumentsBucket:
     Type: AWS::S3::Bucket
+    DependsOn: IngestionQueuePolicy
     Properties:
       BucketName: !Sub "${ProjectName}-${Environment}-raw-docs-${AWS::AccountId}"
       VersioningConfiguration:
@@ -271,21 +256,21 @@ Resources:
                     Value: "uploads/"
 
   # ════════════════════════════════════════════════════════════════════════════
-  # SQS — Ingestion queue (decouples S3 events from Lambda)
+  # SQS
   # ════════════════════════════════════════════════════════════════════════════
 
   IngestionDLQ:
     Type: AWS::SQS::Queue
     Properties:
       QueueName: !Sub "${ProjectName}-${Environment}-ingestion-dlq"
-      MessageRetentionPeriod: 1209600   # 14 days
+      MessageRetentionPeriod: 1209600
 
   IngestionQueue:
     Type: AWS::SQS::Queue
     Properties:
       QueueName: !Sub "${ProjectName}-${Environment}-ingestion-queue"
-      VisibilityTimeout: 960            # 16 min (Lambda max = 15 min + buffer)
-      MessageRetentionPeriod: 86400     # 1 day
+      VisibilityTimeout: 960
+      MessageRetentionPeriod: 86400
       RedrivePolicy:
         deadLetterTargetArn: !GetAtt IngestionDLQ.Arn
         maxReceiveCount: 3
@@ -307,7 +292,7 @@ Resources:
                 "aws:SourceArn": !Sub "arn:aws:s3:::${ProjectName}-${Environment}-raw-docs-${AWS::AccountId}"
 
   # ════════════════════════════════════════════════════════════════════════════
-  # DynamoDB — Session state store
+  # DynamoDB
   # ════════════════════════════════════════════════════════════════════════════
 
   SessionTable:
@@ -330,69 +315,7 @@ Resources:
         Enabled: true
 
   # ════════════════════════════════════════════════════════════════════════════
-  # OpenSearch Serverless
-  # ════════════════════════════════════════════════════════════════════════════
-
-  # Encryption policy
-  OpenSearchEncryptionPolicy:
-    Type: AWS::OpenSearchServerless::SecurityPolicy
-    Properties:
-      Name: !Sub "${ProjectName}-${Environment}-enc"
-      Type: encryption
-      Policy: !Sub |
-        {"Rules":[{"ResourceType":"collection","Resource":["collection/${OpenSearchCollectionName}"]}],"AWSOwnedKey":true}
-
-  # Network policy — allow VPC access only
-  OpenSearchNetworkPolicy:
-    Type: AWS::OpenSearchServerless::SecurityPolicy
-    Properties:
-      Name: !Sub "${ProjectName}-${Environment}-net"
-      Type: network
-      Policy: !Sub |
-        [{"Rules":[{"ResourceType":"collection","Resource":["collection/${OpenSearchCollectionName}"]},
-        {"ResourceType":"dashboard","Resource":["collection/${OpenSearchCollectionName}"]}],
-        "AllowFromPublic":false,
-        "SourceVPCEs":["${OpenSearchVPCEndpoint}"]}]
-
-  OpenSearchVPCEndpoint:
-    Type: AWS::OpenSearchServerless::VpcEndpoint
-    Properties:
-      Name: !Sub "${ProjectName}-${Environment}-aoss-vpce"
-      VpcId: !Ref VPC
-      SubnetIds:
-        - !Ref PrivateSubnet1
-        - !Ref PrivateSubnet2
-      SecurityGroupIds:
-        - !Ref LambdaSecurityGroup
-
-  # Data access policy — grant Lambda roles read/write
-  OpenSearchDataAccessPolicy:
-    Type: AWS::OpenSearchServerless::AccessPolicy
-    Properties:
-      Name: !Sub "${ProjectName}-${Environment}-data"
-      Type: data
-      Policy: !Sub |
-        [{"Rules":[
-          {"ResourceType":"index","Resource":["index/${OpenSearchCollectionName}/*"],
-           "Permission":["aoss:CreateIndex","aoss:DeleteIndex","aoss:UpdateIndex",
-                         "aoss:DescribeIndex","aoss:ReadDocument","aoss:WriteDocument"]},
-          {"ResourceType":"collection","Resource":["collection/${OpenSearchCollectionName}"],
-           "Permission":["aoss:CreateCollectionItems","aoss:DeleteCollectionItems","aoss:UpdateCollectionItems","aoss:DescribeCollectionItems"]}
-        ],"Principal":["${LambdaExecutionRole.Arn}","${IngestionLambdaRole.Arn}"]}]
-
-  OpenSearchCollection:
-    Type: AWS::OpenSearchServerless::Collection
-    DependsOn:
-      - OpenSearchEncryptionPolicy
-      - OpenSearchNetworkPolicy
-      - OpenSearchDataAccessPolicy
-    Properties:
-      Name: !Ref OpenSearchCollectionName
-      Type: VECTORSEARCH
-      Description: !Sub "Vector store for ${ProjectName} ${Environment}"
-
-  # ════════════════════════════════════════════════════════════════════════════
-  # IAM Roles
+  # IAM Roles — created BEFORE OpenSearch policies that reference their ARNs
   # ════════════════════════════════════════════════════════════════════════════
 
   LambdaExecutionRole:
@@ -419,8 +342,8 @@ Resources:
                   - bedrock:InvokeModel
                   - bedrock:InvokeModelWithResponseStream
                 Resource:
-                  - !Sub "arn:aws:bedrock:${BedrockRegion}::foundation-model/${PrimaryModelId}"
-                  - !Sub "arn:aws:bedrock:${BedrockRegion}::foundation-model/amazon.titan-embed-text-v2:0"
+                  - !Sub "arn:aws:bedrock:us-east-1:*:inference-profile/us.anthropic.claude-sonnet-4-20250514-v1:0"
+                  - !Sub "arn:aws:bedrock:us-east-1:*:inference-profile/us.anthropic.claude-haiku-4-5-20251001-v1:0"
               - Sid: OpenSearchAccess
                 Effect: Allow
                 Action:
@@ -432,9 +355,7 @@ Resources:
                   - s3:GetObject
                   - s3:PutObject
                   - s3:HeadObject
-                  - s3:GeneratePresignedUrl
-                Resource:
-                  - !Sub "${RawDocumentsBucket.Arn}/*"
+                Resource: !Sub "arn:aws:s3:::${ProjectName}-${Environment}-raw-docs-${AWS::AccountId}/*"
               - Sid: DynamoDBAccess
                 Effect: Allow
                 Action:
@@ -473,7 +394,7 @@ Resources:
                 Action:
                   - s3:GetObject
                   - s3:HeadObject
-                Resource: !Sub "${RawDocumentsBucket.Arn}/*"
+                Resource: !Sub "arn:aws:s3:::${ProjectName}-${Environment}-raw-docs-${AWS::AccountId}/*"
               - Sid: SQSRead
                 Effect: Allow
                 Action:
@@ -501,6 +422,65 @@ Resources:
                 Resource: "*"
 
   # ════════════════════════════════════════════════════════════════════════════
+  # OpenSearch Serverless
+  # FIX 1: Network policy uses AllowFromPublic:true (no VPC endpoint reference)
+  # FIX 2: Data access policy uses !Sub with explicit variable map for role ARNs
+  # ════════════════════════════════════════════════════════════════════════════
+
+  OpenSearchEncryptionPolicy:
+    Type: AWS::OpenSearchServerless::SecurityPolicy
+    Properties:
+      Name: !Sub "${ProjectName}-${Environment}-enc"
+      Type: encryption
+      Policy: !Sub |
+        {"Rules":[{"ResourceType":"collection","Resource":["collection/${OpenSearchCollectionName}"]}],"AWSOwnedKey":true}
+
+  # FIX 1: AllowFromPublic:true removes the VPC endpoint circular dependency
+  OpenSearchNetworkPolicy:
+    Type: AWS::OpenSearchServerless::SecurityPolicy
+    Properties:
+      Name: !Sub "${ProjectName}-${Environment}-net"
+      Type: network
+      Policy: !Sub |
+        [{"Rules":[
+          {"ResourceType":"collection","Resource":["collection/${OpenSearchCollectionName}"]},
+          {"ResourceType":"dashboard","Resource":["collection/${OpenSearchCollectionName}"]}
+        ],"AllowFromPublic":true}]
+
+  # FIX 2: Use !Sub with variable map to correctly resolve IAM role ARNs
+  OpenSearchDataAccessPolicy:
+    Type: AWS::OpenSearchServerless::AccessPolicy
+    DependsOn:
+      - LambdaExecutionRole
+      - IngestionLambdaRole
+    Properties:
+      Name: !Sub "${ProjectName}-${Environment}-data"
+      Type: data
+      Policy: !Sub
+        - |
+          [{"Rules":[
+            {"ResourceType":"index","Resource":["index/${OpenSearchCollectionName}/*"],
+             "Permission":["aoss:CreateIndex","aoss:DeleteIndex","aoss:UpdateIndex",
+                           "aoss:DescribeIndex","aoss:ReadDocument","aoss:WriteDocument"]},
+            {"ResourceType":"collection","Resource":["collection/${OpenSearchCollectionName}"],
+             "Permission":["aoss:CreateCollectionItems","aoss:DeleteCollectionItems",
+                           "aoss:UpdateCollectionItems","aoss:DescribeCollectionItems"]}
+          ],"Principal":["${LambdaRoleArn}","${IngestionRoleArn}"]}]
+        - LambdaRoleArn: !GetAtt LambdaExecutionRole.Arn
+          IngestionRoleArn: !GetAtt IngestionLambdaRole.Arn
+
+  OpenSearchCollection:
+    Type: AWS::OpenSearchServerless::Collection
+    DependsOn:
+      - OpenSearchEncryptionPolicy
+      - OpenSearchNetworkPolicy
+      - OpenSearchDataAccessPolicy
+    Properties:
+      Name: !Ref OpenSearchCollectionName
+      Type: VECTORSEARCH
+      Description: !Sub "Vector store for ${ProjectName} ${Environment}"
+
+  # ════════════════════════════════════════════════════════════════════════════
   # Lambda Functions
   # ════════════════════════════════════════════════════════════════════════════
 
@@ -512,7 +492,7 @@ Resources:
       Code:
         ImageUri: !Ref IngestionECRImageUri
       Role: !GetAtt IngestionLambdaRole.Arn
-      Timeout: 900          # 15 minutes
+      Timeout: 900
       MemorySize: 1024
       VpcConfig:
         SubnetIds:
@@ -523,11 +503,10 @@ Resources:
       Environment:
         Variables:
           OPENSEARCH_ENDPOINT: !Sub "https://${OpenSearchCollection}.${AWS::Region}.aoss.amazonaws.com"
-          OPENSEARCH_INDEX:    !Sub "${ProjectName}-docs"
-          BEDROCK_REGION:      !Ref BedrockRegion
-          CHUNK_SIZE:          "1000"
-          CHUNK_OVERLAP:       "200"
-      ReservedConcurrentExecutions: 10
+          OPENSEARCH_INDEX: !Sub "${ProjectName}-docs"
+          BEDROCK_REGION: !Ref BedrockRegion
+          CHUNK_SIZE: "1000"
+          CHUNK_OVERLAP: "200"
 
   IngestionEventSourceMapping:
     Type: AWS::Lambda::EventSourceMapping
@@ -556,14 +535,14 @@ Resources:
           - !Ref LambdaSecurityGroup
       Environment:
         Variables:
-          OPENSEARCH_ENDPOINT:    !Sub "https://${OpenSearchCollection}.${AWS::Region}.aoss.amazonaws.com"
-          OPENSEARCH_INDEX:       !Sub "${ProjectName}-docs"
-          BEDROCK_REGION:         !Ref BedrockRegion
-          PRIMARY_MODEL_ID:       !Ref PrimaryModelId
-          FALLBACK_MODEL_ID:      !Ref FallbackModelId
-          RAW_DOCUMENTS_BUCKET:   !Ref RawDocumentsBucket
-          SESSION_TABLE:          !Ref SessionTable
-          DAILY_TOKEN_BUDGET:     !Ref DailyTokenBudget
+          OPENSEARCH_ENDPOINT: !Sub "https://${OpenSearchCollection}.${AWS::Region}.aoss.amazonaws.com"
+          OPENSEARCH_INDEX: !Sub "${ProjectName}-docs"
+          BEDROCK_REGION: !Ref BedrockRegion
+          PRIMARY_MODEL_ID: !Ref PrimaryModelId
+          FALLBACK_MODEL_ID: us.anthropic.claude-haiku-4-5-20251001-v1:0
+          RAW_DOCUMENTS_BUCKET: !Ref RawDocumentsBucket
+          SESSION_TABLE: !Ref SessionTable
+          DAILY_TOKEN_BUDGET: !Ref DailyTokenBudget
 
   # ════════════════════════════════════════════════════════════════════════════
   # API Gateway
@@ -620,7 +599,7 @@ Resources:
       SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${APIGateway}/*"
 
   # ════════════════════════════════════════════════════════════════════════════
-  # Cognito User Pool
+  # Cognito
   # ════════════════════════════════════════════════════════════════════════════
 
   CognitoUserPool:
